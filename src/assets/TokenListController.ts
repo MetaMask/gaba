@@ -1,6 +1,6 @@
+import contractMap from '@metamask/contract-metadata';
 import type { Patch } from 'immer';
 import { Mutex } from 'async-mutex';
-import contractmap from '@metamask/contract-metadata';
 import { BaseController } from '../BaseControllerV2';
 import type { RestrictedControllerMessenger } from '../ControllerMessenger';
 import { safelyExecute } from '../util';
@@ -17,30 +17,53 @@ const DEFAULT_THRESHOLD = 60 * 30 * 1000;
 
 const name = 'TokenListController';
 
-interface DataCache {
-  timestamp: number;
-  data: Token[];
-}
-interface TokensChainsCache {
-  [chainSlug: string]: DataCache;
-}
-
-type Token = {
+type BaseToken = {
   name: string;
-  address: string;
-  decimals: number;
   symbol: string;
-  occurrences: number | null;
-  aggregators: string[] | null;
-  iconUrl: string;
+  decimals: number;
 };
 
-type TokenMap = {
-  [address: string]: Token;
+type StaticToken = {
+  logo: string;
+  erc20: boolean;
+} & BaseToken;
+
+export type ContractMap = {
+  [address: string]: StaticToken;
+};
+
+export type DynamicToken = {
+  address: string;
+  occurrences: number;
+  aggregators: string[];
+  iconUrl: string;
+} & BaseToken;
+
+export enum MediaExtType {
+  SVG = 'SVG',
+  PNG = 'PNG',
+  JPG = 'JPG',
+}
+
+export type IconPath = {
+  filePath: string;
+  type: MediaExtType;
+};
+
+export type TokenListToken = {
+  address: string;
+  iconUrl: string | null;
+  iconPath: IconPath | null;
+  occurrences: number | null;
+  aggregators: string[] | null;
+} & BaseToken;
+
+export type TokenListMap = {
+  [address: string]: TokenListToken;
 };
 
 export type TokenListState = {
-  tokenList: TokenMap;
+  tokenList: TokenListMap;
   tokensChainsCache: TokensChainsCache;
 };
 
@@ -53,6 +76,13 @@ export type GetTokenListState = {
   type: `${typeof name}:getState`;
   handler: () => TokenListState;
 };
+interface DataCache {
+  timestamp: number;
+  data: TokenListToken[];
+}
+interface TokensChainsCache {
+  [chainSlug: string]: DataCache;
+}
 
 const metadata = {
   tokenList: { persist: true, anonymous: true },
@@ -195,11 +225,21 @@ export class TokenListController extends BaseController<
    * Fetching token list from the contract-metadata as a fallback
    */
   async fetchFromStaticTokenList(): Promise<void> {
-    const tokenList: TokenMap = {};
-    for (const tokenAddress in contractmap) {
-      const { erc20, logo, ...token } = contractmap[tokenAddress];
+    const tokenList: TokenListMap = {};
+    for (const tokenAddress in contractMap) {
+      const { erc20, logo: filePath, ...token } = contractMap[tokenAddress];
+      const extType = filePath.split('.')[1].toUpperCase() as MediaExtType;
+      const iconPath: IconPath = { filePath, type: extType };
       if (erc20) {
-        tokenList[tokenAddress] = { ...token, iconUrl: logo };
+        // Specify iconUrl here as filePath for backwards compatibility for extension
+        tokenList[tokenAddress] = {
+          ...token,
+          iconPath,
+          address: tokenAddress,
+          iconUrl: filePath,
+          occurrences: null,
+          aggregators: null,
+        };
       }
     }
     this.update(() => {
@@ -216,35 +256,51 @@ export class TokenListController extends BaseController<
   async fetchFromDynamicTokenList(): Promise<void> {
     const releaseLock = await this.mutex.acquire();
     try {
-      const tokensFromAPI: Token[] = await safelyExecute(() =>
+      const cachedTokens: TokenListToken[] | null = await safelyExecute(() =>
         this.fetchFromCache(),
       );
-      const { tokensChainsCache } = this.state;
-      const tokenList: TokenMap = {};
-
-      // filtering out tokens with less than 2 occurences
-      const filteredTokenList = tokensFromAPI.filter(
-        (token) => token.occurrences && token.occurrences >= 2,
-      );
-      // removing the tokens with symbol conflicts
-      const symbolsList = filteredTokenList.map((token) => token.symbol);
-      const duplicateSymbols = [
-        ...new Set(
-          symbolsList.filter(
-            (symbol, index) => symbolsList.indexOf(symbol) !== index,
+      const { tokensChainsCache, ...tokensData } = this.state;
+      const tokenList: TokenListMap = {};
+      if (cachedTokens) {
+        for (const token of cachedTokens) {
+          tokenList[token.address] = token;
+        }
+      } else {
+        const tokensFromAPI: DynamicToken[] = await safelyExecute(() =>
+          fetchTokenList(this.chainId),
+        );
+        // filtering out tokens with less than 2 occurrences
+        const filteredTokenList = tokensFromAPI.filter(
+          (token) => token.occurrences && token.occurrences >= 2,
+        );
+        // removing the tokens with symbol conflicts
+        const symbolsList = filteredTokenList.map((token) => token.symbol);
+        const duplicateSymbols = [
+          ...new Set(
+            symbolsList.filter(
+              (symbol, index) => symbolsList.indexOf(symbol) !== index,
+            ),
           ),
-        ),
-      ];
-      const uniqueTokenList = filteredTokenList.filter(
-        (token) => !duplicateSymbols.includes(token.symbol),
-      );
-      for (const token of uniqueTokenList) {
-        tokenList[token.address] = token;
+        ];
+        const uniqueTokenList = filteredTokenList.filter(
+          (token) => !duplicateSymbols.includes(token.symbol),
+        );
+        for (const token of uniqueTokenList) {
+          tokenList[token.address] = { ...token, iconPath: null };
+        }
       }
+      const updatedTokensChainsCache: TokensChainsCache = {
+        ...tokensChainsCache,
+        [this.chainId]: {
+          timestamp: Date.now(),
+          data: Object.values(tokenList),
+        },
+      };
       this.update(() => {
         return {
+          ...tokensData,
           tokenList,
-          tokensChainsCache,
+          tokensChainsCache: updatedTokensChainsCache,
         };
       });
     } finally {
@@ -258,8 +314,8 @@ export class TokenListController extends BaseController<
    *  otherwise a call to the API service will be made.
    * @returns Promise that resolves into a TokenList
    */
-  async fetchFromCache(): Promise<Token[]> {
-    const { tokensChainsCache, ...tokensData }: TokenListState = this.state;
+  async fetchFromCache(): Promise<TokenListToken[] | null> {
+    const { tokensChainsCache }: TokenListState = this.state;
     const dataCache = tokensChainsCache[this.chainId];
     const now = Date.now();
     if (
@@ -268,23 +324,7 @@ export class TokenListController extends BaseController<
     ) {
       return dataCache.data;
     }
-    const tokenList: Token[] = await safelyExecute(() =>
-      fetchTokenList(this.chainId),
-    );
-    const updatedTokensChainsCache = {
-      ...tokensChainsCache,
-      [this.chainId]: {
-        timestamp: Date.now(),
-        data: tokenList,
-      },
-    };
-    this.update(() => {
-      return {
-        ...tokensData,
-        tokensChainsCache: updatedTokensChainsCache,
-      };
-    });
-    return tokenList;
+    return null;
   }
 
   /**
@@ -316,12 +356,12 @@ export class TokenListController extends BaseController<
   /**
    * Fetch metadata for a token whose address is send to the API
    * @param tokenAddress
-   * @returns Promise that resolvesto Token Metadata
+   * @returns Promise that resolves to Token Metadata
    */
-  async fetchTokenMetadata(tokenAddress: string): Promise<Token> {
+  async fetchTokenMetadata(tokenAddress: string): Promise<DynamicToken> {
     const releaseLock = await this.mutex.acquire();
     try {
-      const token = await safelyExecute(() =>
+      const token: DynamicToken = await safelyExecute(() =>
         fetchTokenMetadata(this.chainId, tokenAddress),
       );
       return token;
